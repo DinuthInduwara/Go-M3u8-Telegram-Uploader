@@ -7,14 +7,16 @@ import (
 	"Go-M3u8-Downloader/telegram"
 	"bufio"
 	"fmt"
-	"github.com/celestix/gotgproto"
-	"github.com/joho/godotenv"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/celestix/gotgproto"
+	"github.com/joho/godotenv"
 )
 
 func downloadWorker(id int, jobs <-chan string, quit <-chan struct{}, client *gotgproto.Client) {
@@ -53,17 +55,39 @@ func downloadWorker(id int, jobs <-chan string, quit <-chan struct{}, client *go
 				panic(err)
 			}
 
-			for _, videoPath := range mediaList {
-				config := telegram.Config{
-					SessionDB: "video_uploader.db", // SQLite session database
-					VideoPath: videoPath,           // Path to your video file
-					ChatID:    int64(chatID),       // Target chat ID (use @username for channels/groups)
-					Caption:   "OCDS:" + videoPath, // Video caption
-					Thumbnail: "",                  // Optional: path to thumbnail image
-				}
+			var wg sync.WaitGroup
 
-				err = telegram.UploadVideo(client, config)
+			// Add the number of videos to wait for
+			wg.Add(len(mediaList))
+
+			for _, videoPath := range mediaList {
+				// Capture videoPath in the loop to avoid closure issues
+				videoPath := videoPath
+
+				// Launch a goroutine for each video upload
+				go func() {
+					defer wg.Done() // Mark this upload as done when finished
+
+					config := telegram.Config{
+						SessionDB: "video_uploader.db", // SQLite session database
+						VideoPath: videoPath,           // Path to your video file
+						ChatID:    int64(chatID),       // Target chat ID (use @username for channels/groups)
+						Caption:   "OCDS:" + videoPath, // Video caption
+						Thumbnail: "",                  // Optional: path to thumbnail image
+					}
+
+					err := telegram.UploadVideo(client, config)
+					if err != nil {
+						fmt.Printf("[UploadWorker %d] Error uploading %s: %v\n", id, videoPath, err)
+					} else {
+						fmt.Printf("[UploadWorker %d] Successfully uploaded: %s\n", id, videoPath)
+					}
+				}()
 			}
+
+			// Wait for all uploads to complete
+			wg.Wait()
+
 			fmt.Printf("[UploadWorker %d] Finish Uploading: %s\n", id, outputDIR)
 			mediaprocess.CleanupFiles(mediaList)
 		case <-quit:
