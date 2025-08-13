@@ -25,7 +25,6 @@ func downloadWorker(id int, jobs <-chan string, quit <-chan struct{}, client *go
 			if raw == "" {
 				continue
 			}
-			fmt.Printf("[Worker %d] Downloading: %s\n", id, raw)
 
 			url, outputDIR, err := extractor.ExtractURL(raw)
 			if err != nil {
@@ -37,10 +36,13 @@ func downloadWorker(id int, jobs <-chan string, quit <-chan struct{}, client *go
 				fmt.Println("errorGrabbing:", err)
 				continue
 			}
-
-			downloader.StartDownloadTask(m3u8URL, outputDIR, 8)
 			outVIdeo := filepath.Join(outputDIR, outputDIR+".mp4")
-			fmt.Printf("[Worker %d] Finished: %s\n", id, url)
+			if _, err := os.Stat(outVIdeo); os.IsNotExist(err) {
+				fmt.Printf("[Worker %d] Downloading: %s\n", id, raw)
+				downloader.StartDownloadTask(m3u8URL, outputDIR, 8)
+				fmt.Printf("[Worker %d] Finished: %s\n", id, url)
+			}
+
 			fmt.Printf("[MergWorker %d] Starting to Merging Video: %s\n", id, outputDIR)
 			downloader.MergeFiles(outputDIR, outVIdeo)
 			fmt.Printf("[MergWorker %d] Merging Finished: %s\n", id, outputDIR)
