@@ -450,6 +450,7 @@ func MergeFiles(outputDir string, outputName string) {
 		"-i", concatFile,
 		"-c", "copy",
 		outputName,
+		"-y",
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

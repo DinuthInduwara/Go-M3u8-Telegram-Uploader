@@ -5,12 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/celestix/gotgproto"
 	"github.com/celestix/gotgproto/sessionMaker"
@@ -24,64 +22,6 @@ type Config struct {
 	ChatID    int64
 	Caption   string
 	Thumbnail string // Optional thumbnail path
-}
-
-// ProgressReader wraps an io.Reader and provides progress tracking
-type ProgressReader struct {
-	reader         io.Reader
-	total          int64
-	current        int64
-	lastUpdate     time.Time
-	updateInterval time.Duration
-}
-
-// NewProgressReader creates a new progress reader
-func NewProgressReader(reader io.Reader, total int64) *ProgressReader {
-	return &ProgressReader{
-		reader:         reader,
-		total:          total,
-		current:        0,
-		lastUpdate:     time.Now(),
-		updateInterval: 100 * time.Millisecond, // Update every 100ms
-	}
-}
-
-// Read implements io.Reader interface and tracks progress
-func (pr *ProgressReader) Read(p []byte) (n int, err error) {
-	n, err = pr.reader.Read(p)
-	pr.current += int64(n)
-
-	// Update progress display
-	now := time.Now()
-	if now.Sub(pr.lastUpdate) >= pr.updateInterval || err == io.EOF {
-		pr.displayProgress()
-		pr.lastUpdate = now
-	}
-
-	return n, err
-}
-
-// displayProgress shows the current upload progress
-func (pr *ProgressReader) displayProgress() {
-	if pr.total == 0 {
-		fmt.Printf("\rUploaded: %.2f MB", float64(pr.current)/(1024*1024))
-		return
-	}
-
-	percent := float64(pr.current) / float64(pr.total) * 100
-	uploadedMB := float64(pr.current) / (1024 * 1024)
-	totalMB := float64(pr.total) / (1024 * 1024)
-
-	// Create progress bar
-	barWidth := 30
-	filled := int(percent / 100 * float64(barWidth))
-	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
-
-	fmt.Printf("\r[%s] %.1f%% (%.2f/%.2f MB)", bar, percent, uploadedMB, totalMB)
-
-	if percent >= 100 {
-		fmt.Println() // New line when complete
-	}
 }
 
 func NewTelegramClient(apiIDInt int, apiHash string, phoneNumber string) *gotgproto.Client {
@@ -119,6 +59,23 @@ func getMimeType(filename string) string {
 	}
 }
 
+type progressBar struct{}
+
+// Chunk implements uploader.Progress interface
+func (p *progressBar) Chunk(ctx context.Context, state uploader.ProgressState) error {
+	percent := float64(state.Uploaded) / float64(state.Total) * 100
+	fmt.Printf("\r[%-30s] %.1f%% (%.2f/%.2f MB)",
+		strings.Repeat("█", int(percent/100*30)),
+		percent,
+		float64(state.Uploaded)/(1024*1024),
+		float64(state.Total)/(1024*1024),
+	)
+	if state.Uploaded == state.Total {
+		fmt.Println()
+	}
+	return nil
+}
+
 func UploadVideo(client *gotgproto.Client, config Config) error {
 	// Create context
 	ctx := context.Background()
@@ -134,27 +91,12 @@ func UploadVideo(client *gotgproto.Client, config Config) error {
 
 	fmt.Printf("Uploading video: %s (%.2f MB)\n", fileName, float64(fileSize)/(1024*1024))
 
-	// Open the file
-	file, err := os.Open(config.VideoPath)
+	u := uploader.NewUploader(client.API()).
+		WithProgress(&progressBar{})
+
+	videoFile, err := u.FromPath(ctx, config.VideoPath)
 	if err != nil {
-		return fmt.Errorf("failed to open video file: %w", err)
-	}
-	defer file.Close()
-
-	// Create uploader instance
-	u := uploader.NewUploader(client.API())
-
-	f, _ := os.Open(config.VideoPath)
-	defer f.Close()
-
-	stat, _ := f.Stat()
-
-	progress := NewProgressReader(f, stat.Size())
-
-	videoFile, err := u.FromReader(ctx, fileName, io.TeeReader(progress, io.Discard))
-	if err != nil {
-		fmt.Println() // New line after progress bar
-		return fmt.Errorf("failed to upload video file: %w", err)
+		panic(fmt.Errorf("failed to upload video file: %w", err))
 	}
 
 	fmt.Println("Video file uploaded to Telegram servers")
