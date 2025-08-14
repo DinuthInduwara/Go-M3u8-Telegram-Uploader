@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -23,6 +22,13 @@ type M3U8Item struct {
 	URL       string `json:"url"`
 	MimeType  string `json:"mime_type"`
 	Bandwidth int    `json:"bandwidth,omitempty"`
+}
+
+// PlayerData represents extracted player information
+type PlayerData struct {
+	M3U8URLs  []M3U8Item `json:"m3u8_urls"`
+	PosterURL string     `json:"poster_url,omitempty"`
+	BestM3U8  string     `json:"best_m3u8,omitempty"`
 }
 
 // M3U8Playlist represents a playlist entry in master M3U8
@@ -150,6 +156,121 @@ func getBestStreamURL(masterURL string) (string, error) {
 
 	fmt.Printf("📊 Selected stream: %s (Bandwidth: %d)\n", bestURL, bestPlaylist.Bandwidth)
 	return bestURL, nil
+}
+
+// extractPosterImage extracts poster image URLs from video elements
+func (g *M3U8Grabber) extractPosterImage(ctx context.Context) string {
+	fmt.Println("🖼️ Extracting poster image...")
+
+	var posterURL string
+
+	// JavaScript to extract poster URLs from various video player elements
+	js := `
+		(function() {
+			var posterUrls = [];
+			
+			// Check video elements with poster attribute
+			var videos = document.querySelectorAll('video[poster]');
+			for (var i = 0; i < videos.length; i++) {
+				if (videos[i].poster) {
+					posterUrls.push(videos[i].poster);
+				}
+			}
+			
+			// Check data-poster attributes
+			var dataPosterElements = document.querySelectorAll('[data-poster]');
+			for (var i = 0; i < dataPosterElements.length; i++) {
+				if (dataPosterElements[i].getAttribute('data-poster')) {
+					posterUrls.push(dataPosterElements[i].getAttribute('data-poster'));
+				}
+			}
+			
+			// Check common video player containers
+			var playerSelectors = [
+				'.jwplayer[data-poster]',
+				'.plyr[data-poster]',
+				'.video-js[data-poster]',
+				'[class*="player"][data-poster]',
+				'[id*="player"][data-poster]',
+				'.video-container[data-poster]',
+				'.player-container[data-poster]'
+			];
+			
+			for (var s = 0; s < playerSelectors.length; s++) {
+				var elements = document.querySelectorAll(playerSelectors[s]);
+				for (var i = 0; i < elements.length; i++) {
+					var poster = elements[i].getAttribute('data-poster');
+					if (poster) {
+						posterUrls.push(poster);
+					}
+				}
+			}
+			
+			// Check for poster in style attributes (background-image)
+			var styledElements = document.querySelectorAll('[style*="background-image"]');
+			for (var i = 0; i < styledElements.length; i++) {
+				var style = styledElements[i].getAttribute('style');
+				if (style) {
+					var urlMatch = style.match(/background-image:\s*url\(['"]?([^'"]+)['"]?\)/);
+					if (urlMatch && urlMatch[1]) {
+						posterUrls.push(urlMatch[1]);
+					}
+				}
+			}
+			
+			// Check for poster in CSS computed styles
+			var videoContainers = document.querySelectorAll('.video-container, .player-container, [class*="video"], [class*="player"]');
+			for (var i = 0; i < videoContainers.length; i++) {
+				var computedStyle = window.getComputedStyle(videoContainers[i]);
+				var bgImage = computedStyle.backgroundImage;
+				if (bgImage && bgImage !== 'none') {
+					var urlMatch = bgImage.match(/url\(['"]?([^'"]+)['"]?\)/);
+					if (urlMatch && urlMatch[1]) {
+						posterUrls.push(urlMatch[1]);
+					}
+				}
+			}
+			
+			// Check meta tags for thumbnail/poster
+			var metaTags = document.querySelectorAll('meta[property="og:image"], meta[name="twitter:image"], meta[property="og:image:url"]');
+			for (var i = 0; i < metaTags.length; i++) {
+				var content = metaTags[i].getAttribute('content');
+				if (content) {
+					posterUrls.push(content);
+				}
+			}
+			
+			// Filter out invalid URLs and return the first valid one
+			for (var i = 0; i < posterUrls.length; i++) {
+				var url = posterUrls[i].trim();
+				if (url && (url.startsWith('http') || url.startsWith('//'))) {
+					// Convert protocol-relative URLs to absolute
+					if (url.startsWith('//')) {
+						url = window.location.protocol + url;
+					}
+					return url;
+				}
+			}
+			
+			return '';
+		})();
+	`
+
+	err := chromedp.Run(ctx,
+		chromedp.Evaluate(js, &posterURL),
+	)
+	if err != nil {
+		fmt.Printf("⚠️ Error extracting poster: %v\n", err)
+		return ""
+	}
+
+	if posterURL != "" {
+		fmt.Printf("🖼️ Found poster image: %s\n", posterURL)
+	} else {
+		fmt.Println("⚠️ No poster image found")
+	}
+
+	return posterURL
 }
 
 // extractM3U8FromLogs analyzes network logs for M3U8 URLs
@@ -295,7 +416,7 @@ func (g *M3U8Grabber) simulateUserInteraction(ctx context.Context) error {
 }
 
 // GrabM3U8URL is the main method to grab M3U8 URLs from a website
-func (g *M3U8Grabber) GrabM3U8URL(targetURL string) ([]M3U8Item, error) {
+func (g *M3U8Grabber) GrabM3U8URL(targetURL string) (*PlayerData, error) {
 	fmt.Println("🚀 Starting optimized Chrome browser...")
 
 	// Set up Chrome options
@@ -375,6 +496,9 @@ func (g *M3U8Grabber) GrabM3U8URL(targetURL string) ([]M3U8Item, error) {
 		fmt.Println("⚠️ No video player found, continuing anyway...")
 	}
 
+	// Extract poster image first
+	posterURL := g.extractPosterImage(ctx)
+
 	// Simulate user interactions
 	err = g.simulateUserInteraction(ctx)
 	if err != nil {
@@ -426,20 +550,41 @@ func (g *M3U8Grabber) GrabM3U8URL(targetURL string) ([]M3U8Item, error) {
 		}
 	}
 
+	// Create PlayerData struct
+	playerData := &PlayerData{
+		M3U8URLs:  m3u8URLs,
+		PosterURL: posterURL,
+	}
+
 	if len(m3u8URLs) > 0 {
 		fmt.Printf("🎉 Successfully found %d M3U8 URL(s)!\n", len(m3u8URLs))
 		for i, item := range m3u8URLs {
 			fmt.Printf("  %d. %s\n", i+1, item.URL)
 		}
+
+		// Try to get the best stream URL
+		for _, item := range m3u8URLs {
+			bestURL, err := getBestStreamURL(item.URL)
+			if err == nil {
+				playerData.BestM3U8 = bestURL
+				break
+			}
+		}
+
+		// If no best URL found, use the first M3U8 URL
+		if playerData.BestM3U8 == "" && len(m3u8URLs) > 0 {
+			playerData.BestM3U8 = m3u8URLs[0].URL
+		}
 	} else {
 		fmt.Println("😞 No M3U8 URLs found")
 	}
 
-	return m3u8URLs, nil
+	return playerData, nil
 }
 
-func GetM3u8URL(targetURL string) (string, error) {
-	fmt.Println("🎯 M3U8 Link Grabber")
+// GetPlayerData extracts both M3U8 URLs and poster image from a website
+func GetPlayerData(targetURL string) (*PlayerData, error) {
+	fmt.Println("🎯 M3U8 Link & Poster Grabber")
 	fmt.Println(strings.Repeat("=", 50))
 	fmt.Printf("Target URL: %s\n", targetURL)
 	fmt.Println(strings.Repeat("=", 50))
@@ -447,47 +592,63 @@ func GetM3u8URL(targetURL string) (string, error) {
 	// Create grabber instance
 	grabber := NewM3U8Grabber(true, 30)
 
-	// Grab M3U8 URLs
-	m3u8URLs, err := grabber.GrabM3U8URL(targetURL)
+	// Grab player data
+	playerData, err := grabber.GrabM3U8URL(targetURL)
 	if err != nil {
 		fmt.Printf("❌ Error occurred: %v\n", err)
-		os.Exit(1)
+		return nil, err
 	}
 
 	// Output results
 	fmt.Println("\n" + strings.Repeat("=", 50))
 	fmt.Println("📋 RESULTS:")
 
-	if len(m3u8URLs) > 0 {
-		fmt.Printf("✅ Found %d M3U8 URL(s):\n", len(m3u8URLs))
+	if len(playerData.M3U8URLs) > 0 {
+		fmt.Printf("✅ Found %d M3U8 URL(s):\n", len(playerData.M3U8URLs))
 
-		for i, item := range m3u8URLs {
+		for i, item := range playerData.M3U8URLs {
 			fmt.Printf("\n%d. URL: %s\n", i+1, item.URL)
 			fmt.Printf("   MIME Type: %s\n", item.MimeType)
 		}
 
-		for _, item := range m3u8URLs {
-			if !strings.Contains(item.URL, "playlist.m3u8") {
-				fmt.Printf("⚠️ Skipping non-M3U8 URL: %s\n", item.URL)
-				continue
-			}
-
-			bestURL, err := getBestStreamURL(item.URL)
-			if err != nil {
-				fmt.Printf("⚠️ Failed to get best stream URL: %v\n", err)
-				bestURL = item.URL // Fallback to original URL
-			}
-
-			return bestURL, nil
+		if playerData.BestM3U8 != "" {
+			fmt.Printf("\n🏆 Best Quality Stream: %s\n", playerData.BestM3U8)
 		}
-
 	} else {
 		fmt.Println("❌ No M3U8 URLs found")
+	}
+
+	if playerData.PosterURL != "" {
+		fmt.Printf("\n🖼️ Poster Image: %s\n", playerData.PosterURL)
+	} else {
+		fmt.Println("\n⚠️ No poster image found")
+	}
+
+	if len(playerData.M3U8URLs) == 0 {
 		fmt.Println("\n💡 Troubleshooting tips:")
 		fmt.Println("  1. Check if the website is accessible")
 		fmt.Println("  2. The video might require additional user interaction")
 		fmt.Println("  3. Try running with headless=false to see what's happening")
 		fmt.Println("  4. The website might be using a different video player")
 	}
-	return "", fmt.Errorf("no m3u8 found")
+
+	return playerData, nil
+}
+
+// Legacy function for backward compatibility
+func GetVideoDetails(targetURL string) (string, string, error) {
+	playerData, err := GetPlayerData(targetURL)
+	if err != nil {
+		return "", "", err
+	}
+
+	if playerData.BestM3U8 != "" {
+		return playerData.BestM3U8, playerData.PosterURL, nil
+	}
+
+	if len(playerData.M3U8URLs) > 0 {
+		return playerData.M3U8URLs[0].URL, playerData.PosterURL, nil
+	}
+
+	return "", "", fmt.Errorf("no m3u8 found")
 }

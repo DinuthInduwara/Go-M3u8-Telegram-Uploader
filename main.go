@@ -18,7 +18,13 @@ import (
 	"github.com/joho/godotenv"
 )
 
-func downloadWorker(id int, jobs <-chan string, quit <-chan struct{}, client *gotgproto.Client) {
+type UploadTask struct {
+	OutputDir string
+	VideoFile string
+	ThumbFile string
+}
+
+func downloadWorker(id int, jobs <-chan string, uploadJobs chan<- UploadTask, quit <-chan struct{}) {
 	for {
 		select {
 		case raw := <-jobs:
@@ -31,47 +37,36 @@ func downloadWorker(id int, jobs <-chan string, quit <-chan struct{}, client *go
 				fmt.Println("errorExtracting:", err)
 				continue
 			}
-			m3u8URL, err := extractor.GrabM3u8URL(url)
+
+			m3u8URL, thumbFile, err := extractor.GetVideoDetails(url)
 			if err != nil {
-				fmt.Println("errorGrabbing:", err)
-				continue
+				fmt.Printf("program cannot find any m3u8 file (exit code %d)", err)
+				return
 			}
-			outVIdeo := filepath.Join(outputDIR, outputDIR+".mp4")
-			if _, err := os.Stat(outVIdeo); os.IsNotExist(err) {
+
+			if m3u8URL == "" {
+				fmt.Println("no playlist.m3u8 URL found in output file")
+				return
+			}
+
+			outVideo := filepath.Join(outputDIR, outputDIR+".mp4")
+			if _, err := os.Stat(outVideo); os.IsNotExist(err) {
 				fmt.Printf("[Worker %d] Downloading: %s\n", id, raw)
 				downloader.StartDownloadTask(m3u8URL, outputDIR, 8)
 				fmt.Printf("[Worker %d] Finished: %s\n", id, url)
 			}
 
-			fmt.Printf("[MergWorker %d] Starting to Merging Video: %s\n", id, outputDIR)
-			downloader.MergeFiles(outputDIR, outVIdeo)
-			fmt.Printf("[MergWorker %d] Merging Finished: %s\n", id, outputDIR)
-			fmt.Printf("[UploadWorker %d] Started To Upload: %s\n", id, outputDIR)
-			chatID, err := strconv.Atoi(os.Getenv("TARGET"))
-			if err != nil {
-				panic(err)
-			}
-			mediaList, err := mediaprocess.SplitVideoWithFFmpeg(outVIdeo)
-			if err != nil {
-				panic(err)
+			fmt.Printf("[MergeWorker %d] Starting to Merge: %s\n", id, outputDIR)
+			downloader.MergeFiles(outputDIR, outVideo)
+			fmt.Printf("[MergeWorker %d] Merging Finished: %s\n", id, outputDIR)
+
+			// Send upload task to upload worker
+			uploadJobs <- UploadTask{
+				OutputDir: outputDIR,
+				VideoFile: outVideo,
+				ThumbFile: thumbFile,
 			}
 
-			for _, videoPath := range mediaList {
-				config := telegram.Config{
-					SessionDB: "video_uploader.db", // SQLite session database
-					VideoPath: videoPath,           // Path to your video file
-					ChatID:    int64(chatID),       // Target chat ID (use @username for channels/groups)
-					Caption:   "OCDS:" + videoPath, // Video caption
-					Thumbnail: "",                  // Optional: path to thumbnail image
-				}
-
-				err = telegram.UploadVideo(client, config)
-				if err != nil {
-					panic(err)
-				}
-			}
-			fmt.Printf("[UploadWorker %d] Finish Uploading: %s\n", id, outputDIR)
-			mediaprocess.CleanupFiles(mediaList)
 		case <-quit:
 			fmt.Printf("[Worker %d] Quitting\n", id)
 			return
@@ -79,38 +74,82 @@ func downloadWorker(id int, jobs <-chan string, quit <-chan struct{}, client *go
 	}
 }
 
-func main() {
+func uploadWorker(uploadJobs <-chan UploadTask, client *gotgproto.Client) {
+	for task := range uploadJobs {
+		fmt.Printf("[UploadWorker] Started uploading: %s\n", task.OutputDir)
 
+		chatID, err := strconv.Atoi(os.Getenv("TARGET"))
+		if err != nil {
+			panic(err)
+		}
+
+		mediaList, err := mediaprocess.SplitVideoWithFFmpeg(task.VideoFile)
+		if err != nil {
+			panic(err)
+		}
+
+		for _, videoPath := range mediaList {
+			config := telegram.Config{
+				SessionDB: "video_uploader.db",
+				VideoPath: videoPath,
+				ChatID:    int64(chatID),
+				Caption:   filepath.Base(videoPath),
+				Thumbnail: task.ThumbFile, // Optional thumbnail path
+			}
+
+			err = telegram.UploadVideo(client, config)
+			if err != nil {
+				panic(err)
+			}
+		}
+
+		fmt.Printf("[UploadWorker] Finished uploading: %s\n", task.OutputDir)
+		mediaprocess.CleanupFiles(mediaList)
+	}
+}
+
+func parseURLTXT(txtPath string) []string {
+	file, err := os.Open(txtPath)
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+
+	var urls []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			urls = append(urls, line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		panic(err)
+	}
+	return urls
+}
+
+func main() {
 	jobs := make(chan string, 20)
+	uploadJobs := make(chan UploadTask, 5) // small buffer for uploads
 	quit := make(chan struct{})
 
 	err := godotenv.Load(".env")
 	if err != nil {
-		log.Printf("Error loading .env file: %v. Proceeding without .env variables.", err)
+		log.Printf("Error loading .env file: %v", err)
 	}
+
 	apiID := os.Getenv("API_ID")
 	apiHash := os.Getenv("APP_HASH")
 	phoneNumber := os.Getenv("PHONE_NUMBER")
-
-	fmt.Println("Video uploaded successfully!")
 
 	apiIDInt, err := strconv.Atoi(apiID)
 	if err != nil {
 		log.Fatalln("failed to convert API_ID to int:", err)
 	}
+
 	client := telegram.NewTelegramClient(apiIDInt, apiHash, phoneNumber)
 	fmt.Printf("client (@%s) has been started...\n", client.Self.Username)
-
-	if len(os.Args) < 2 {
-		fmt.Println("🚀 M3U8 Downloader - Enhanced with Progress")
-		fmt.Println("Usage:  <m3u8_url> ")
-		fmt.Println("Example: https://missav.ws/en/piyo-186")
-		fmt.Println("\nFeatures:")
-		fmt.Println("  ✅ Concurrent downloads")
-		fmt.Println("  ✅ Progress tracking")
-		fmt.Println("  ✅ Automatic retry on failures")
-		fmt.Println("  ✅ Resume partial downloads")
-	}
 
 	fmt.Print("Enter number of workers: ")
 	scanner := bufio.NewScanner(os.Stdin)
@@ -122,37 +161,49 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Start download workers
 	for i := 1; i <= workerCount; i++ {
-		go downloadWorker(i, jobs, quit, client)
+		go downloadWorker(i, jobs, uploadJobs, quit)
 	}
-	fmt.Printf("Started %d workers.\n", workerCount)
 
-	go func() {
+	// Start single upload worker
+	go uploadWorker(uploadJobs, client)
+
+	fmt.Printf("Started %d download workers and 1 upload worker.\n", workerCount)
+
+	if len(os.Args) > 1 {
+		txtPath := os.Args[1]
+		urls := parseURLTXT(txtPath)
+		for _, url := range urls {
+			jobs <- url
+		}
+	} else {
+		fmt.Println("🚀 M3U8 Downloader - Enhanced with Upload Queue")
+		go func() {
+			for {
+				downloader.DisplayAllProgress(downloader.RunningTasks)
+				time.Sleep(time.Second)
+			}
+		}()
+
 		for {
-			downloader.DisplayAllProgress(downloader.RunningTasks)
-			time.Sleep(time.Second)
+			fmt.Print("> ")
+			if !scanner.Scan() {
+				break
+			}
+			line := strings.TrimSpace(scanner.Text())
+
+			if strings.EqualFold(line, "exit") {
+				close(quit)
+				close(jobs)
+				close(uploadJobs)
+				break
+			}
+
+			if line != "" {
+				jobs <- line
+				fmt.Println("Added to queue:", line)
+			}
 		}
-	}()
-
-	for {
-		fmt.Print("> ")
-		if !scanner.Scan() {
-			break
-		}
-
-		line := strings.TrimSpace(scanner.Text())
-
-		if strings.EqualFold(line, "exit") {
-			close(quit)
-			close(jobs)
-			break
-		}
-
-		if line != "" {
-			jobs <- line
-			fmt.Println("Added to queue:", line)
-		}
-
 	}
-
 }

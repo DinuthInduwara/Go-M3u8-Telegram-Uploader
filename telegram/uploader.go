@@ -129,7 +129,7 @@ func UploadVideo(client *gotgproto.Client, config Config) error {
 	if config.Thumbnail != "" {
 		if _, err := os.Stat(config.Thumbnail); err == nil {
 			fmt.Println("Uploading thumbnail...")
-			thumbFile, err := uploader.NewUploader(client.API()).FromPath(ctx, config.Thumbnail)
+			thumbFile, err := uploader.NewUploader(client.API()).FromURL(ctx, config.Thumbnail)
 			if err != nil {
 				log.Printf("Warning: Failed to upload thumbnail: %v", err)
 			} else {
