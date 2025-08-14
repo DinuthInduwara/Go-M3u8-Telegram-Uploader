@@ -76,7 +76,7 @@ func (p *progressBar) Chunk(ctx context.Context, state uploader.ProgressState) e
 	return nil
 }
 
-func uploadVideo(client *gotgproto.Client, config Config) error {
+func UploadVideo(client *gotgproto.Client, config Config) error {
 	ctx := context.Background()
 
 	// Get file info
