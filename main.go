@@ -1,6 +1,7 @@
 package main
 
 import (
+	"Go-M3u8-Downloader/database"
 	"Go-M3u8-Downloader/downloader"
 	"Go-M3u8-Downloader/extractor"
 	"Go-M3u8-Downloader/mediaprocess"
@@ -35,6 +36,10 @@ func downloadWorker(id int, jobs <-chan string, uploadJobs chan<- UploadTask, qu
 			url, outputDIR, err := extractor.ExtractURL(raw)
 			if err != nil {
 				fmt.Println("errorExtracting:", err)
+				continue
+			}
+			if database.IsDownloaded(url) {
+				fmt.Printf("[Worker %d] Already downloaded: %s\n", id, url)
 				continue
 			}
 
@@ -105,6 +110,14 @@ func uploadWorker(uploadJobs <-chan UploadTask, client *gotgproto.Client) {
 
 		fmt.Printf("[UploadWorker] Finished uploading: %s\n", task.OutputDir)
 		mediaprocess.CleanupFiles(mediaList)
+		err = os.RemoveAll(filepath.Dir(task.VideoFile))
+		if err != nil {
+			fmt.Printf("Error removing directory: %v\n", err)
+		}
+		database.MarkAsDownloaded(task.VideoFile)
+		fmt.Printf("[UploadWorker] Marked as downloaded: %s\n", task.VideoFile)
+		fmt.Printf("[UploadWorker] Finished processing: %s\n", task.OutputDir)
+		fmt.Println("========================================")
 	}
 }
 
