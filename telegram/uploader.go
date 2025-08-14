@@ -141,15 +141,17 @@ func UploadVideo(client *gotgproto.Client, config Config) error {
 	}
 	defer file.Close()
 
-	// Create progress reader
-	progressReader := NewProgressReader(file, fileSize)
-
 	// Create uploader instance
-	u := uploader.NewUploader(client.API())
+	u := uploader.NewUploader(client.API()).WithPartSize(1024 * 1024)
 
-	// Upload the video file with progress tracking
-	fmt.Println("Starting upload...")
-	videoFile, err := u.FromReader(ctx, fileName, progressReader)
+	f, _ := os.Open(config.VideoPath)
+	defer f.Close()
+
+	stat, _ := f.Stat()
+
+	progress := NewProgressReader(f, stat.Size())
+
+	videoFile, err := u.FromReader(ctx, fileName, io.TeeReader(progress, io.Discard))
 	if err != nil {
 		fmt.Println() // New line after progress bar
 		return fmt.Errorf("failed to upload video file: %w", err)
