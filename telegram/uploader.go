@@ -142,7 +142,7 @@ func UploadVideo(client *gotgproto.Client, config Config) error {
 	defer file.Close()
 
 	// Create uploader instance
-	u := uploader.NewUploader(client.API()).WithPartSize(1024 * 1024)
+	u := uploader.NewUploader(client.API())
 
 	f, _ := os.Open(config.VideoPath)
 	defer f.Close()
