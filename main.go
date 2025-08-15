@@ -210,13 +210,13 @@ func (p *Pipeline) startJobDispatcher() {
 				}
 
 				// Check if already downloaded _=outputDir
-				url, _, err := extractor.ExtractURL(job.URL)
+				url, outputDir, err := extractor.ExtractURL(job.URL)
 				if err != nil {
 					p.logger.JobStatus(job, "FAILED", "URL extraction failed: %v", err)
 					continue
 				}
 
-				if database.IsDownloaded(url) {
+				if database.IsDownloaded(outputDir) {
 					p.logger.JobStatus(job, "SKIPPED", "Already downloaded: %s", url)
 					p.incrementCompleted()
 					continue
@@ -453,7 +453,7 @@ func (p *Pipeline) processUploadTask(downloadResult DownloadResult) {
 			p.logger.JobStatus(task.Job, "CLEANUP_WARNING", "Failed to remove directory: %v", err)
 		}
 
-		database.MarkAsDownloaded(task.VideoFile)
+		database.MarkAsDownloaded(filepath.Dir(task.VideoFile))
 		p.logger.JobStatus(task.Job, "MARKED_COMPLETE", "Marked as downloaded in database")
 	}
 
