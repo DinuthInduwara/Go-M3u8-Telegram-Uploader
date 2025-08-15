@@ -65,11 +65,13 @@ type progressBar struct{}
 // Chunk implements uploader.Progress interface
 func (p *progressBar) Chunk(ctx context.Context, state uploader.ProgressState) error {
 	percent := float64(state.Uploaded) / float64(state.Total) * 100
-	fmt.Printf("\r[%-30s] %.1f%% (%.2f/%.2f MB)",
+	fmt.Printf("\r[%-30s] %.1f%% (%.2f/%.2f MB)  %d - %s",
 		strings.Repeat("█", int(percent/100*30)),
 		percent,
 		float64(state.Uploaded)/(1024*1024),
 		float64(state.Total)/(1024*1024),
+		state.Part,
+		state.Name,
 	)
 	if state.Uploaded == state.Total {
 		fmt.Println()
