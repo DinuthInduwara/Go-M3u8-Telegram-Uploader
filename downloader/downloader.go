@@ -440,7 +440,7 @@ func MergeFiles(outputDir string, outputName string) {
 	defer f.Close()
 
 	for _, file := range files {
-		_, _ = f.WriteString(fmt.Sprintf("file '%s'\n", filepath.ToSlash(file)))
+		_, _ = f.WriteString(fmt.Sprintf("file '%s'\n", filepath.Base(file)))
 	}
 	fmt.Println("✅ Concat list created:", concatFile)
 
