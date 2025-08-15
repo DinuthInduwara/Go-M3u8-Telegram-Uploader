@@ -7,128 +7,590 @@ import (
 	"Go-M3u8-Downloader/mediaprocess"
 	"Go-M3u8-Downloader/telegram"
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/celestix/gotgproto"
 	"github.com/joho/godotenv"
 )
 
+// Job represents a download job with metadata
+type Job struct {
+	ID       int
+	URL      string
+	Status   string
+	Created  time.Time
+	Started  *time.Time
+	Finished *time.Time
+}
+
+// DownloadResult represents the result of a download operation
+type DownloadResult struct {
+	Job       Job
+	OutputDir string
+	VideoFile string
+	ThumbFile string
+	Error     error
+}
+
+// UploadTask represents an upload task
 type UploadTask struct {
+	Job       Job
 	OutputDir string
 	VideoFile string
 	ThumbFile string
 }
 
-func downloadWorker(id int, jobs <-chan string, uploadJobs chan<- UploadTask, quit <-chan struct{}) {
+// UploadResult represents the result of an upload operation
+type UploadResult struct {
+	Task  UploadTask
+	Error error
+}
+
+// Pipeline manages the entire download-upload pipeline
+type Pipeline struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	client *gotgproto.Client
+	config Config
+
+	// Channels for pipeline stages
+	jobQueue      chan Job
+	downloadQueue chan Job
+	uploadQueue   chan DownloadResult
+	resultQueue   chan UploadResult
+
+	// Metrics and monitoring
+	stats  *PipelineStats
+	logger *Logger
+
+	wg sync.WaitGroup
+}
+
+// Config holds pipeline configuration
+type Config struct {
+	WorkerCount  int
+	QueueSize    int
+	TargetChatID int64
+	SessionDB    string
+}
+
+// PipelineStats tracks pipeline metrics
+type PipelineStats struct {
+	mu              sync.RWMutex
+	TotalJobs       int
+	CompletedJobs   int
+	FailedJobs      int
+	ActiveDownloads int
+	ActiveUploads   int
+	StartTime       time.Time
+}
+
+// Logger provides structured logging
+type Logger struct {
+	*log.Logger
+}
+
+func NewLogger() *Logger {
+	return &Logger{
+		Logger: log.New(os.Stdout, "", log.LstdFlags),
+	}
+}
+
+func (l *Logger) Info(format string, args ...interface{}) {
+	l.Printf("[INFO] "+format, args...)
+}
+
+func (l *Logger) Error(format string, args ...interface{}) {
+	l.Printf("[ERROR] "+format, args...)
+}
+
+func (l *Logger) Debug(format string, args ...interface{}) {
+	l.Printf("[DEBUG] "+format, args...)
+}
+
+func (l *Logger) JobStatus(job Job, status string, args ...interface{}) {
+	prefix := fmt.Sprintf("[JOB-%d] %s: ", job.ID, status)
+	l.Printf(prefix+fmt.Sprintf("%v", args...), args[1:]...)
+}
+
+// NewPipeline creates a new pipeline instance
+func NewPipeline(client *gotgproto.Client, config Config) *Pipeline {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	return &Pipeline{
+		ctx:           ctx,
+		cancel:        cancel,
+		client:        client,
+		config:        config,
+		jobQueue:      make(chan Job, config.QueueSize),
+		downloadQueue: make(chan Job, config.QueueSize),
+		uploadQueue:   make(chan DownloadResult, config.QueueSize),
+		resultQueue:   make(chan UploadResult, config.QueueSize),
+		stats: &PipelineStats{
+			StartTime: time.Now(),
+		},
+		logger: NewLogger(),
+	}
+}
+
+// Start initializes and starts the pipeline
+func (p *Pipeline) Start() error {
+	p.logger.Info("Starting M3U8 Download Pipeline")
+	p.logger.Info("Configuration: Workers=%d, QueueSize=%d", p.config.WorkerCount, p.config.QueueSize)
+
+	// Start pipeline stages
+	p.startJobDispatcher()
+	p.startDownloadWorkers()
+	p.startUploadWorker()
+	p.startResultProcessor()
+	p.startStatsMonitor()
+
+	p.logger.Info("Pipeline started successfully")
+	return nil
+}
+
+// Stop gracefully shuts down the pipeline
+func (p *Pipeline) Stop() {
+	p.logger.Info("Shutting down pipeline...")
+	p.cancel()
+
+	// Close channels in reverse order
+	close(p.jobQueue)
+	p.wg.Wait()
+
+	p.logger.Info("Pipeline shutdown complete")
+	p.printFinalStats()
+}
+
+// SubmitJob adds a new job to the pipeline
+func (p *Pipeline) SubmitJob(url string) {
+	p.stats.mu.Lock()
+	p.stats.TotalJobs++
+	jobID := p.stats.TotalJobs
+	p.stats.mu.Unlock()
+
+	job := Job{
+		ID:      jobID,
+		URL:     url,
+		Status:  "queued",
+		Created: time.Now(),
+	}
+
+	select {
+	case p.jobQueue <- job:
+		p.logger.JobStatus(job, "QUEUED", "URL: %s", url)
+	case <-p.ctx.Done():
+		p.logger.Error("Failed to queue job - pipeline shutting down")
+	}
+}
+
+// startJobDispatcher manages job distribution
+func (p *Pipeline) startJobDispatcher() {
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer close(p.downloadQueue)
+
+		p.logger.Info("Job dispatcher started")
+
+		for {
+			select {
+			case job, ok := <-p.jobQueue:
+				if !ok {
+					p.logger.Info("Job queue closed, stopping dispatcher")
+					return
+				}
+
+				// Check if already downloaded _=outputDir
+				url, _ , err := extractor.ExtractURL(job.URL)
+				if err != nil {
+					p.logger.JobStatus(job, "FAILED", "URL extraction failed: %v", err)
+					continue
+				}
+
+				if database.IsDownloaded(url) {
+					p.logger.JobStatus(job, "SKIPPED", "Already downloaded: %s", url)
+					p.incrementCompleted()
+					continue
+				}
+
+				job.Status = "dispatched"
+				select {
+				case p.downloadQueue <- job:
+					p.logger.JobStatus(job, "DISPATCHED", "Sent to download queue")
+				case <-p.ctx.Done():
+					return
+				}
+
+			case <-p.ctx.Done():
+				p.logger.Info("Job dispatcher stopping")
+				return
+			}
+		}
+	}()
+}
+
+// startDownloadWorkers starts multiple download workers
+func (p *Pipeline) startDownloadWorkers() {
+	for i := 1; i <= p.config.WorkerCount; i++ {
+		p.wg.Add(1)
+		go p.downloadWorker(i)
+	}
+}
+
+// downloadWorker processes download jobs
+func (p *Pipeline) downloadWorker(workerID int) {
+	defer p.wg.Done()
+
+	p.logger.Info("Download worker %d started", workerID)
+
 	for {
 		select {
-		case raw := <-jobs:
-			if raw == "" {
-				continue
-			}
-
-			url, outputDIR, err := extractor.ExtractURL(raw)
-			if err != nil {
-				fmt.Println("errorExtracting:", err)
-				continue
-			}
-			if database.IsDownloaded(url) {
-				fmt.Printf("[Worker %d] Already downloaded: %s\n", id, url)
-				continue
-			}
-
-			m3u8URL, thumbFile, err := extractor.GetVideoDetails(url)
-			if err != nil {
-				fmt.Printf("program cannot find any m3u8 file (exit code %d)", err)
+		case job, ok := <-p.downloadQueue:
+			if !ok {
+				p.logger.Info("Download worker %d: queue closed", workerID)
 				return
 			}
 
-			if m3u8URL == "" {
-				fmt.Println("no playlist.m3u8 URL found in output file")
-				return
-			}
+			p.processDownloadJob(workerID, job)
 
-			outVideo := filepath.Join(outputDIR, outputDIR+".mp4")
-			if _, err := os.Stat(outVideo); os.IsNotExist(err) {
-				fmt.Printf("[Worker %d] Downloading: %s\n", id, raw)
-				downloader.StartDownloadTask(m3u8URL, outputDIR, 8)
-				fmt.Printf("[Worker %d] Finished: %s\n", id, url)
-			}
-
-			fmt.Printf("[MergeWorker %d] Starting to Merge: %s\n", id, outputDIR)
-			downloader.MergeFiles(outputDIR, outVideo)
-			fmt.Printf("[MergeWorker %d] Merging Finished: %s\n", id, outputDIR)
-
-			// Send upload task to upload worker
-			uploadJobs <- UploadTask{
-				OutputDir: outputDIR,
-				VideoFile: outVideo,
-				ThumbFile: thumbFile,
-			}
-
-		case <-quit:
-			fmt.Printf("[Worker %d] Quitting\n", id)
+		case <-p.ctx.Done():
+			p.logger.Info("Download worker %d stopping", workerID)
 			return
 		}
 	}
 }
 
-func uploadWorker(uploadJobs <-chan UploadTask, client *gotgproto.Client) {
-	for task := range uploadJobs {
-		fmt.Printf("[UploadWorker] Started uploading: %s\n", task.OutputDir)
+// processDownloadJob handles individual download job processing
+func (p *Pipeline) processDownloadJob(workerID int, job Job) {
+	p.incrementActiveDownloads(1)
+	defer p.incrementActiveDownloads(-1)
 
-		chatID, err := strconv.Atoi(os.Getenv("TARGET"))
-		if err != nil {
-			fmt.Println("Error converting TARGET to int:")
-			panic(err)
+	now := time.Now()
+	job.Started = &now
+	job.Status = "downloading"
+
+	p.logger.JobStatus(job, "STARTED", "Worker %d processing", workerID)
+
+	result := DownloadResult{Job: job}
+
+	// Extract URL and output directory
+	url, outputDir, err := extractor.ExtractURL(job.URL)
+	if err != nil {
+		result.Error = fmt.Errorf("URL extraction failed: %w", err)
+		p.sendDownloadResult(result)
+		return
+	}
+
+	result.OutputDir = outputDir
+
+	// Get video details
+	p.logger.JobStatus(job, "EXTRACTING", "Getting video details")
+	m3u8URL, thumbFile, err := extractor.GetVideoDetails(url)
+	if err != nil {
+		result.Error = fmt.Errorf("failed to get video details: %w", err)
+		p.sendDownloadResult(result)
+		return
+	}
+
+	if m3u8URL == "" {
+		result.Error = fmt.Errorf("no playlist.m3u8 URL found")
+		p.sendDownloadResult(result)
+		return
+	}
+
+	result.ThumbFile = thumbFile
+	result.VideoFile = filepath.Join(outputDir, outputDir+".mp4")
+
+	// Check if video already exists
+	if _, err := os.Stat(result.VideoFile); !os.IsNotExist(err) {
+		p.logger.JobStatus(job, "EXISTS", "Video file already exists: %s", result.VideoFile)
+	} else {
+		// Download video segments
+		p.logger.JobStatus(job, "DOWNLOADING", "Starting segment download from: %s", m3u8URL)
+		downloader.StartDownloadTask(m3u8URL, outputDir, 8)
+		p.logger.JobStatus(job, "DOWNLOAD_COMPLETE", "Segment download finished")
+	}
+
+	// Merge video files
+	p.logger.JobStatus(job, "MERGING", "Starting file merge")
+	downloader.MergeFiles(outputDir, result.VideoFile)
+	p.logger.JobStatus(job, "MERGE_COMPLETE", "File merge finished: %s", result.VideoFile)
+
+	// Mark job as completed
+	finished := time.Now()
+	result.Job.Finished = &finished
+	result.Job.Status = "downloaded"
+
+	duration := finished.Sub(*job.Started)
+	p.logger.JobStatus(job, "COMPLETED", "Download finished in %v", duration)
+
+	p.sendDownloadResult(result)
+}
+
+// sendDownloadResult sends result to upload queue
+func (p *Pipeline) sendDownloadResult(result DownloadResult) {
+	select {
+	case p.uploadQueue <- result:
+		if result.Error != nil {
+			p.logger.JobStatus(result.Job, "ERROR", "Download failed: %v", result.Error)
+			p.incrementFailed()
+		} else {
+			p.logger.JobStatus(result.Job, "QUEUED_UPLOAD", "Sent to upload queue")
 		}
-
-		mediaList, err := mediaprocess.SplitVideoWithFFmpeg(task.VideoFile)
-		if err != nil {
-			fmt.Println("Error splitting video: ")
-			panic(err)
-		}
-
-		for _, videoPath := range mediaList {
-			config := telegram.Config{
-				SessionDB: "video_uploader.db",
-				VideoPath: videoPath,
-				ChatID:    int64(chatID),
-				Caption:   filepath.Base(videoPath),
-				Thumbnail: task.ThumbFile, // Optional thumbnail path
-			}
-
-			err = telegram.UploadVideo(client, config)
-			if err != nil {
-				fmt.Println("Error uploading video:")
-				panic(err)
-			}
-		}
-
-		fmt.Printf("[UploadWorker] Finished uploading: %s\n", task.OutputDir)
-		mediaprocess.CleanupFiles(mediaList)
-		err = os.RemoveAll(filepath.Dir(task.VideoFile))
-		if err != nil {
-			fmt.Printf("Error removing directory: %v\n", err)
-		}
-		database.MarkAsDownloaded(task.VideoFile)
-		fmt.Printf("[UploadWorker] Marked as downloaded: %s\n", task.VideoFile)
-		fmt.Printf("[UploadWorker] Finished processing: %s\n", task.OutputDir)
-		fmt.Println("========================================")
+	case <-p.ctx.Done():
+		p.logger.Error("Failed to send download result - pipeline shutting down")
 	}
 }
 
-func parseURLTXT(txtPath string) []string {
+// startUploadWorker starts the upload worker
+func (p *Pipeline) startUploadWorker() {
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer close(p.resultQueue)
+
+		p.logger.Info("Upload worker started")
+
+		for {
+			select {
+			case result, ok := <-p.uploadQueue:
+				if !ok {
+					p.logger.Info("Upload queue closed, stopping upload worker")
+					return
+				}
+
+				if result.Error != nil {
+					// Skip upload for failed downloads
+					uploadResult := UploadResult{
+						Task:  UploadTask{Job: result.Job},
+						Error: result.Error,
+					}
+					p.sendUploadResult(uploadResult)
+					continue
+				}
+
+				p.processUploadTask(result)
+
+			case <-p.ctx.Done():
+				p.logger.Info("Upload worker stopping")
+				return
+			}
+		}
+	}()
+}
+
+// processUploadTask handles individual upload task processing
+func (p *Pipeline) processUploadTask(downloadResult DownloadResult) {
+	p.incrementActiveUploads(1)
+	defer p.incrementActiveUploads(-1)
+
+	task := UploadTask{
+		Job:       downloadResult.Job,
+		OutputDir: downloadResult.OutputDir,
+		VideoFile: downloadResult.VideoFile,
+		ThumbFile: downloadResult.ThumbFile,
+	}
+
+	task.Job.Status = "uploading"
+	p.logger.JobStatus(task.Job, "UPLOAD_STARTED", "Processing: %s", task.VideoFile)
+
+	uploadResult := UploadResult{Task: task}
+
+	// Split video if needed
+	p.logger.JobStatus(task.Job, "SPLITTING", "Splitting video with FFmpeg")
+	mediaList, err := mediaprocess.SplitVideoWithFFmpeg(task.VideoFile)
+	if err != nil {
+		uploadResult.Error = fmt.Errorf("video splitting failed: %w", err)
+		p.sendUploadResult(uploadResult)
+		return
+	}
+
+	p.logger.JobStatus(task.Job, "SPLIT_COMPLETE", "Video split into %d parts", len(mediaList))
+
+	// Upload each part
+	for i, videoPath := range mediaList {
+		p.logger.JobStatus(task.Job, "UPLOADING_PART", "Part %d/%d: %s", i+1, len(mediaList), filepath.Base(videoPath))
+
+		config := telegram.Config{
+			SessionDB: p.config.SessionDB,
+			VideoPath: videoPath,
+			ChatID:    p.config.TargetChatID,
+			Caption:   filepath.Base(videoPath),
+			Thumbnail: task.ThumbFile,
+		}
+
+		err = telegram.UploadVideo(p.client, config)
+		if err != nil {
+			uploadResult.Error = fmt.Errorf("upload failed for part %d: %w", i+1, err)
+			break
+		}
+
+		p.logger.JobStatus(task.Job, "PART_UPLOADED", "Part %d/%d uploaded successfully", i+1, len(mediaList))
+	}
+
+	if uploadResult.Error == nil {
+		task.Job.Status = "completed"
+		finished := time.Now()
+		task.Job.Finished = &finished
+
+		totalDuration := finished.Sub(task.Job.Created)
+		p.logger.JobStatus(task.Job, "UPLOAD_COMPLETE", "All parts uploaded successfully (total time: %v)", totalDuration)
+
+		// Cleanup
+		p.logger.JobStatus(task.Job, "CLEANING", "Cleaning up temporary files")
+		mediaprocess.CleanupFiles(mediaList)
+
+		if err := os.RemoveAll(filepath.Dir(task.VideoFile)); err != nil {
+			p.logger.JobStatus(task.Job, "CLEANUP_WARNING", "Failed to remove directory: %v", err)
+		}
+
+		database.MarkAsDownloaded(task.VideoFile)
+		p.logger.JobStatus(task.Job, "MARKED_COMPLETE", "Marked as downloaded in database")
+	}
+
+	p.sendUploadResult(uploadResult)
+}
+
+// sendUploadResult sends result to result processor
+func (p *Pipeline) sendUploadResult(result UploadResult) {
+	select {
+	case p.resultQueue <- result:
+	case <-p.ctx.Done():
+	}
+}
+
+// startResultProcessor processes final results
+func (p *Pipeline) startResultProcessor() {
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+
+		p.logger.Info("Result processor started")
+
+		for {
+			select {
+			case result, ok := <-p.resultQueue:
+				if !ok {
+					p.logger.Info("Result queue closed, stopping result processor")
+					return
+				}
+
+				if result.Error != nil {
+					p.logger.JobStatus(result.Task.Job, "FAILED", "Final error: %v", result.Error)
+					p.incrementFailed()
+				} else {
+					p.logger.JobStatus(result.Task.Job, "SUCCESS", "Job completed successfully")
+					p.incrementCompleted()
+				}
+
+				p.logger.Info("========================================")
+
+			case <-p.ctx.Done():
+				p.logger.Info("Result processor stopping")
+				return
+			}
+		}
+	}()
+}
+
+// startStatsMonitor displays periodic statistics
+func (p *Pipeline) startStatsMonitor() {
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				p.printStats()
+			case <-p.ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// Helper methods for stats
+func (p *Pipeline) incrementActiveDownloads(delta int) {
+	p.stats.mu.Lock()
+	p.stats.ActiveDownloads += delta
+	p.stats.mu.Unlock()
+}
+
+func (p *Pipeline) incrementActiveUploads(delta int) {
+	p.stats.mu.Lock()
+	p.stats.ActiveUploads += delta
+	p.stats.mu.Unlock()
+}
+
+func (p *Pipeline) incrementCompleted() {
+	p.stats.mu.Lock()
+	p.stats.CompletedJobs++
+	p.stats.mu.Unlock()
+}
+
+func (p *Pipeline) incrementFailed() {
+	p.stats.mu.Lock()
+	p.stats.FailedJobs++
+	p.stats.mu.Unlock()
+}
+
+// printStats displays current pipeline statistics
+func (p *Pipeline) printStats() {
+	p.stats.mu.RLock()
+	defer p.stats.mu.RUnlock()
+
+	uptime := time.Since(p.stats.StartTime)
+
+	fmt.Printf("\n📊 Pipeline Statistics (Uptime: %v)\n", uptime.Truncate(time.Second))
+	fmt.Printf("├── Total Jobs: %d\n", p.stats.TotalJobs)
+	fmt.Printf("├── Completed: %d\n", p.stats.CompletedJobs)
+	fmt.Printf("├── Failed: %d\n", p.stats.FailedJobs)
+	fmt.Printf("├── Active Downloads: %d\n", p.stats.ActiveDownloads)
+	fmt.Printf("├── Active Uploads: %d\n", p.stats.ActiveUploads)
+
+	pending := p.stats.TotalJobs - p.stats.CompletedJobs - p.stats.FailedJobs
+	fmt.Printf("└── Pending: %d\n", pending)
+	fmt.Println()
+}
+
+// printFinalStats displays final statistics when shutting down
+func (p *Pipeline) printFinalStats() {
+	p.stats.mu.RLock()
+	defer p.stats.mu.RUnlock()
+
+	uptime := time.Since(p.stats.StartTime)
+
+	fmt.Println("\n🏁 Final Pipeline Statistics")
+	fmt.Printf("├── Total Runtime: %v\n", uptime.Truncate(time.Second))
+	fmt.Printf("├── Total Jobs: %d\n", p.stats.TotalJobs)
+	fmt.Printf("├── Completed: %d\n", p.stats.CompletedJobs)
+	fmt.Printf("├── Failed: %d\n", p.stats.FailedJobs)
+
+	if p.stats.TotalJobs > 0 {
+		successRate := float64(p.stats.CompletedJobs) / float64(p.stats.TotalJobs) * 100
+		fmt.Printf("└── Success Rate: %.1f%%\n", successRate)
+	}
+	fmt.Println()
+}
+
+// parseURLTXT reads URLs from a text file
+func parseURLTXT(txtPath string) ([]string, error) {
 	file, err := os.Open(txtPath)
 	if err != nil {
-		log.Printf("Error opening file %s: ", txtPath)
-		panic(err)
+		return nil, fmt.Errorf("failed to open file %s: %w", txtPath, err)
 	}
 	defer file.Close()
 
@@ -136,91 +598,156 @@ func parseURLTXT(txtPath string) []string {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
+		if line != "" && !strings.HasPrefix(line, "#") {
 			urls = append(urls, line)
 		}
 	}
+
 	if err := scanner.Err(); err != nil {
-		log.Printf("Error reading file %s: ", txtPath)
-		panic(err)
+		return nil, fmt.Errorf("failed to read file %s: %w", txtPath, err)
 	}
-	return urls
+
+	return urls, nil
 }
 
-func main() {
-	jobs := make(chan string, 2)
-	uploadJobs := make(chan UploadTask, 2) // small buffer for uploads
-	quit := make(chan struct{})
-
+// loadConfig loads configuration from environment variables
+func loadConfig() (Config, error) {
 	err := godotenv.Load(".env")
 	if err != nil {
-		log.Printf("Error loading .env file: %v", err)
+		log.Printf("Warning: Error loading .env file: %v", err)
 	}
 
+	targetStr := os.Getenv("TARGET")
+	if targetStr == "" {
+		return Config{}, fmt.Errorf("TARGET environment variable is required")
+	}
+
+	targetChatID, err := strconv.ParseInt(targetStr, 10, 64)
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid TARGET value: %w", err)
+	}
+
+	return Config{
+		WorkerCount:  3, // Default value, will be overridden by user input
+		QueueSize:    10,
+		TargetChatID: targetChatID,
+		SessionDB:    "video_uploader.db",
+	}, nil
+}
+
+// setupTelegramClient initializes the Telegram client
+func setupTelegramClient() (*gotgproto.Client, error) {
 	apiID := os.Getenv("API_ID")
 	apiHash := os.Getenv("APP_HASH")
 	phoneNumber := os.Getenv("PHONE_NUMBER")
 
+	if apiID == "" || apiHash == "" || phoneNumber == "" {
+		return nil, fmt.Errorf("API_ID, APP_HASH, and PHONE_NUMBER environment variables are required")
+	}
+
 	apiIDInt, err := strconv.Atoi(apiID)
 	if err != nil {
-		log.Fatalln("failed to convert API_ID to int:", err)
+		return nil, fmt.Errorf("invalid API_ID: %w", err)
 	}
 
 	client := telegram.NewTelegramClient(apiIDInt, apiHash, phoneNumber)
-	fmt.Printf("client (@%s) has been started...\n", client.Self.Username)
+	fmt.Printf("✅ Telegram client (@%s) initialized successfully\n", client.Self.Username)
 
-	fmt.Print("Enter number of workers: ")
+	return client, nil
+}
+
+func main() {
+	fmt.Println("🚀 M3U8 Downloader - Enhanced Pipeline Architecture")
+	fmt.Println("==================================================")
+
+	// Load configuration
+	config, err := loadConfig()
+	if err != nil {
+		log.Fatal("Configuration error:", err)
+	}
+
+	// Setup Telegram client
+	client, err := setupTelegramClient()
+	if err != nil {
+		log.Fatal("Telegram client error:", err)
+	}
+
+	// Get worker count from user
+	fmt.Print("Enter number of download workers (default: 3): ")
 	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Scan()
-	workerInput := strings.TrimSpace(scanner.Text())
-	workerCount, err := strconv.Atoi(workerInput)
-	if err != nil || workerCount <= 0 {
-		fmt.Println("Invalid worker count.")
-		os.Exit(1)
+	if scanner.Scan() {
+		workerInput := strings.TrimSpace(scanner.Text())
+		if workerInput != "" {
+			if workerCount, err := strconv.Atoi(workerInput); err == nil && workerCount > 0 {
+				config.WorkerCount = workerCount
+			} else {
+				fmt.Println("Invalid worker count, using default: 3")
+				config.WorkerCount = 3
+			}
+		}
 	}
 
-	// Start download workers
-	for i := 1; i <= workerCount; i++ {
-		go downloadWorker(i, jobs, uploadJobs, quit)
+	// Create and start pipeline
+	pipeline := NewPipeline(client, config)
+	if err := pipeline.Start(); err != nil {
+		log.Fatal("Failed to start pipeline:", err)
 	}
 
-	// Start single upload worker
-	go uploadWorker(uploadJobs, client)
+	// Handle shutdown gracefully
+	defer pipeline.Stop()
 
-	fmt.Printf("Started %d download workers and 1 upload worker.\n", workerCount)
-
+	// Process input
 	if len(os.Args) > 1 {
+		// Batch mode - process file
 		txtPath := os.Args[1]
-		urls := parseURLTXT(txtPath)
+		urls, err := parseURLTXT(txtPath)
+		if err != nil {
+			log.Fatal("Failed to parse URL file:", err)
+		}
+
+		fmt.Printf("📁 Loaded %d URLs from file: %s\n", len(urls), txtPath)
 		for _, url := range urls {
-			jobs <- url
+			pipeline.SubmitJob(url)
+		}
+
+		// Wait for all jobs to complete
+		for {
+			time.Sleep(time.Second)
+			pipeline.stats.mu.RLock()
+			pending := pipeline.stats.TotalJobs - pipeline.stats.CompletedJobs - pipeline.stats.FailedJobs
+			pipeline.stats.mu.RUnlock()
+
+			if pending == 0 {
+				break
+			}
 		}
 	} else {
-		fmt.Println("🚀 M3U8 Downloader - Enhanced with Upload Queue")
-		go func() {
-			for {
-				downloader.DisplayAllProgress(downloader.RunningTasks)
-				time.Sleep(time.Second)
-			}
-		}()
+		// Interactive mode
+		fmt.Println("💬 Interactive mode - Enter URLs or 'exit' to quit")
+		fmt.Println("Commands:")
+		fmt.Println("  - Enter a URL to download")
+		fmt.Println("  - Type 'stats' to show current statistics")
+		fmt.Println("  - Type 'exit' to quit")
+		fmt.Println()
 
 		for {
 			fmt.Print("> ")
 			if !scanner.Scan() {
 				break
 			}
+
 			line := strings.TrimSpace(scanner.Text())
 
-			if strings.EqualFold(line, "exit") {
-				close(quit)
-				close(jobs)
-				close(uploadJobs)
-				break
-			}
-
-			if line != "" {
-				jobs <- line
-				fmt.Println("Added to queue:", line)
+			switch strings.ToLower(line) {
+			case "exit", "quit":
+				fmt.Println("👋 Shutting down...")
+				return
+			case "stats":
+				pipeline.printStats()
+			case "":
+				continue
+			default:
+				pipeline.SubmitJob(line)
 			}
 		}
 	}
