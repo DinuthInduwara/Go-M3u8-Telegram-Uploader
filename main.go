@@ -210,7 +210,7 @@ func (p *Pipeline) startJobDispatcher() {
 				}
 
 				// Check if already downloaded _=outputDir
-				url, _ , err := extractor.ExtractURL(job.URL)
+				url, _, err := extractor.ExtractURL(job.URL)
 				if err != nil {
 					p.logger.JobStatus(job, "FAILED", "URL extraction failed: %v", err)
 					continue
@@ -629,7 +629,7 @@ func loadConfig() (Config, error) {
 
 	return Config{
 		WorkerCount:  3, // Default value, will be overridden by user input
-		QueueSize:    10,
+		QueueSize:    3,
 		TargetChatID: targetChatID,
 		SessionDB:    "video_uploader.db",
 	}, nil
