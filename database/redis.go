@@ -29,6 +29,7 @@ func IsDownloaded(videoID string) bool {
 	fmt.Println("Checking if video is downloaded:", videoID)
 	exists, err := RedisCLI.SIsMember(ctx, "downloaded_videos", videoID).Result()
 	if err != nil {
+		fmt.Println("Error checking Redis:")
 		panic(err)
 	}
 
@@ -42,6 +43,7 @@ func IsDownloaded(videoID string) bool {
 func MarkAsDownloaded(videoID string) {
 	ctx := context.Background()
 	if err := RedisCLI.SAdd(ctx, "downloaded_videos", videoID).Err(); err != nil {
+		fmt.Println("Error marking video as downloaded:")
 		panic(err)
 	}
 	fmt.Println("Marked as downloaded:", videoID)

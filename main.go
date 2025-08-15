@@ -85,11 +85,13 @@ func uploadWorker(uploadJobs <-chan UploadTask, client *gotgproto.Client) {
 
 		chatID, err := strconv.Atoi(os.Getenv("TARGET"))
 		if err != nil {
+			fmt.Println("Error converting TARGET to int:")
 			panic(err)
 		}
 
 		mediaList, err := mediaprocess.SplitVideoWithFFmpeg(task.VideoFile)
 		if err != nil {
+			fmt.Println("Error splitting video: ")
 			panic(err)
 		}
 
@@ -104,6 +106,7 @@ func uploadWorker(uploadJobs <-chan UploadTask, client *gotgproto.Client) {
 
 			err = telegram.UploadVideo(client, config)
 			if err != nil {
+				fmt.Println("Error uploading video:")
 				panic(err)
 			}
 		}
@@ -124,6 +127,7 @@ func uploadWorker(uploadJobs <-chan UploadTask, client *gotgproto.Client) {
 func parseURLTXT(txtPath string) []string {
 	file, err := os.Open(txtPath)
 	if err != nil {
+		log.Printf("Error opening file %s: ", txtPath)
 		panic(err)
 	}
 	defer file.Close()
@@ -137,14 +141,15 @@ func parseURLTXT(txtPath string) []string {
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		log.Printf("Error reading file %s: ", txtPath)
 		panic(err)
 	}
 	return urls
 }
 
 func main() {
-	jobs := make(chan string, 20)
-	uploadJobs := make(chan UploadTask, 5) // small buffer for uploads
+	jobs := make(chan string, 2)
+	uploadJobs := make(chan UploadTask, 2) // small buffer for uploads
 	quit := make(chan struct{})
 
 	err := godotenv.Load(".env")

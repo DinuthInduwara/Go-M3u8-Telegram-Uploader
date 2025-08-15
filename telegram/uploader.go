@@ -36,6 +36,7 @@ func NewTelegramClient(apiIDInt int, apiHash string, phoneNumber string) *gotgpr
 		},
 	)
 	if err != nil {
+		log.Fatalf("Failed to create Telegram client: %v", err)
 		panic(err)
 	}
 	return client

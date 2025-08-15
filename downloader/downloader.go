@@ -417,6 +417,7 @@ func StartDownloadTask(m3u8URL string, outputDir string, concurrentSegmentsCount
 func MergeFiles(outputDir string, outputName string) {
 	files, err := filepath.Glob(filepath.Join(outputDir, "*.ts"))
 	if err != nil {
+		fmt.Println("❌ Error finding .ts files: ")
 		panic(err)
 	}
 
@@ -433,6 +434,7 @@ func MergeFiles(outputDir string, outputName string) {
 	concatFile := "concat_list.txt"
 	f, err := os.Create(concatFile)
 	if err != nil {
+		fmt.Println("❌ Error creating concat list file:")
 		panic(err)
 	}
 	defer f.Close()
@@ -458,7 +460,8 @@ func MergeFiles(outputDir string, outputName string) {
 	fmt.Println("🚀 Merging segments into", outputName, "...")
 	err = cmd.Run()
 	if err != nil {
-		panic(fmt.Errorf("ffmpeg merge failed: %v", err))
+		fmt.Println("❌ Error merging files: ")
+		panic(err)
 	}
 
 	fmt.Println("✅ Merge complete! Output file:", outputName)
