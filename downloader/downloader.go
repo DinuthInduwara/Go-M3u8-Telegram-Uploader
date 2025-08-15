@@ -431,7 +431,7 @@ func MergeFiles(outputDir string, outputName string) {
 	fmt.Println(files)
 
 	// Step 4: Create FFmpeg concat list file
-	concatFile := "concat_list.txt"
+	concatFile := filepath.Join(outputDir, "concat_list.txt")
 	f, err := os.Create(concatFile)
 	if err != nil {
 		fmt.Println("❌ Error creating concat list file:")
