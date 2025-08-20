@@ -222,20 +222,13 @@ func (p *Pipeline) startJobDispatcher() {
 				}
 
 				// Extract URL and check custom output directory
-				url, outputDir, err := extractor.ExtractURL(job.URL)
+				url, _, err := extractor.ExtractURL(job.URL)
 				if err != nil {
 					p.logger.JobStatus(job, "FAILED", "URL extraction failed: %v", err)
 					continue
 				}
 
-				// Use custom output directory if specified
-				if p.config.OutputDir != "./" {
-					// Create custom output directory structure
-					customOutputDir := filepath.Join(p.config.OutputDir, outputDir)
-					outputDir = customOutputDir
-				}
-
-				if database.IsDownloaded(outputDir) {
+				if database.IsDownloaded(url) {
 					p.logger.JobStatus(job, "SKIPPED", "Already downloaded: %s", url)
 					p.incrementCompleted()
 					continue
@@ -542,7 +535,7 @@ func (p *Pipeline) processUploadTask(downloadResult DownloadResult) {
 			}
 		}
 
-		database.MarkAsDownloaded(filepath.Dir(task.VideoFile))
+		database.MarkAsDownloaded(filepath.Base(filepath.Dir(task.VideoFile)))
 		p.logger.JobStatus(task.Job, "MARKED_COMPLETE", "Marked as downloaded in database")
 	}
 
