@@ -8,6 +8,7 @@ import (
 	"Go-M3u8-Downloader/telegram"
 	"bufio"
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -76,10 +77,12 @@ type Pipeline struct {
 
 // Config holds pipeline configuration
 type Config struct {
-	WorkerCount  int
-	QueueSize    int
-	TargetChatID int64
-	SessionDB    string
+	WorkerCount    int
+	QueueSize      int
+	TargetChatID   int64
+	SessionDB      string
+	OutputDir      string  // Added for custom output directory
+	UploadToTG     bool    // Added for telegram upload control
 }
 
 // PipelineStats tracks pipeline metrics
@@ -144,12 +147,21 @@ func NewPipeline(client *gotgproto.Client, config Config) *Pipeline {
 // Start initializes and starts the pipeline
 func (p *Pipeline) Start() error {
 	p.logger.Info("Starting M3U8 Download Pipeline")
-	p.logger.Info("Configuration: Workers=%d, QueueSize=%d", p.config.WorkerCount, p.config.QueueSize)
+	p.logger.Info("Configuration: Workers=%d, QueueSize=%d, OutputDir=%s, UploadToTG=%t", 
+		p.config.WorkerCount, p.config.QueueSize, p.config.OutputDir, p.config.UploadToTG)
 
 	// Start pipeline stages
 	p.startJobDispatcher()
 	p.startDownloadWorkers()
-	p.startUploadWorker()
+	
+	// Only start upload worker if telegram upload is enabled
+	if p.config.UploadToTG {
+		p.startUploadWorker()
+	} else {
+		// If not uploading to telegram, directly process download results
+		p.startDownloadOnlyProcessor()
+	}
+	
 	p.startResultProcessor()
 	p.startStatsMonitor()
 
@@ -209,11 +221,18 @@ func (p *Pipeline) startJobDispatcher() {
 					return
 				}
 
-				// Check if already downloaded _=outputDir
+				// Extract URL and check custom output directory
 				url, outputDir, err := extractor.ExtractURL(job.URL)
 				if err != nil {
 					p.logger.JobStatus(job, "FAILED", "URL extraction failed: %v", err)
 					continue
+				}
+
+				// Use custom output directory if specified
+				if p.config.OutputDir != "./" {
+					// Create custom output directory structure
+					customOutputDir := filepath.Join(p.config.OutputDir, outputDir)
+					outputDir = customOutputDir
 				}
 
 				if database.IsDownloaded(outputDir) {
@@ -290,6 +309,20 @@ func (p *Pipeline) processDownloadJob(workerID int, job Job) {
 		return
 	}
 
+	// Use custom output directory if specified
+	if p.config.OutputDir != "./" {
+		// Create custom output directory structure
+		customOutputDir := filepath.Join(p.config.OutputDir, outputDir)
+		outputDir = customOutputDir
+		
+		// Ensure the custom directory exists
+		if err := os.MkdirAll(outputDir, 0755); err != nil {
+			result.Error = fmt.Errorf("failed to create output directory: %w", err)
+			p.sendDownloadResult(result)
+			return
+		}
+	}
+
 	result.OutputDir = outputDir
 
 	// Get video details
@@ -308,7 +341,7 @@ func (p *Pipeline) processDownloadJob(workerID int, job Job) {
 	}
 
 	result.ThumbFile = thumbFile
-	result.VideoFile = filepath.Join(outputDir, outputDir+".mp4")
+	result.VideoFile = filepath.Join(outputDir, filepath.Base(outputDir)+".mp4")
 
 	// Check if video already exists
 	if _, err := os.Stat(result.VideoFile); !os.IsNotExist(err) {
@@ -336,7 +369,7 @@ func (p *Pipeline) processDownloadJob(workerID int, job Job) {
 	p.sendDownloadResult(result)
 }
 
-// sendDownloadResult sends result to upload queue
+// sendDownloadResult sends result to upload queue or download-only processor
 func (p *Pipeline) sendDownloadResult(result DownloadResult) {
 	select {
 	case p.uploadQueue <- result:
@@ -344,11 +377,65 @@ func (p *Pipeline) sendDownloadResult(result DownloadResult) {
 			p.logger.JobStatus(result.Job, "ERROR", "Download failed: %v", result.Error)
 			p.incrementFailed()
 		} else {
-			p.logger.JobStatus(result.Job, "QUEUED_UPLOAD", "Sent to upload queue")
+			if p.config.UploadToTG {
+				p.logger.JobStatus(result.Job, "QUEUED_UPLOAD", "Sent to upload queue")
+			} else {
+				p.logger.JobStatus(result.Job, "DOWNLOAD_ONLY", "Download completed, skipping upload")
+			}
 		}
 	case <-p.ctx.Done():
 		p.logger.Error("Failed to send download result - pipeline shutting down")
 	}
+}
+
+// startDownloadOnlyProcessor handles downloads when upload is disabled
+func (p *Pipeline) startDownloadOnlyProcessor() {
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer close(p.resultQueue)
+
+		p.logger.Info("Download-only processor started (Telegram upload disabled)")
+
+		for {
+			select {
+			case result, ok := <-p.uploadQueue:
+				if !ok {
+					p.logger.Info("Upload queue closed, stopping download-only processor")
+					return
+				}
+
+				// Create result for download-only mode
+				uploadResult := UploadResult{
+					Task: UploadTask{
+						Job:       result.Job,
+						OutputDir: result.OutputDir,
+						VideoFile: result.VideoFile,
+						ThumbFile: result.ThumbFile,
+					},
+					Error: result.Error,
+				}
+
+				if result.Error == nil {
+					uploadResult.Task.Job.Status = "completed"
+					finished := time.Now()
+					uploadResult.Task.Job.Finished = &finished
+
+					totalDuration := finished.Sub(uploadResult.Task.Job.Created)
+					p.logger.JobStatus(uploadResult.Task.Job, "DOWNLOAD_COMPLETE", "Download completed in %v (kept locally)", totalDuration)
+
+					database.MarkAsDownloaded(filepath.Dir(uploadResult.Task.VideoFile))
+					p.logger.JobStatus(uploadResult.Task.Job, "MARKED_COMPLETE", "Marked as downloaded in database")
+				}
+
+				p.sendUploadResult(uploadResult)
+
+			case <-p.ctx.Done():
+				p.logger.Info("Download-only processor stopping")
+				return
+			}
+		}
+	}()
 }
 
 // startUploadWorker starts the upload worker
@@ -445,12 +532,14 @@ func (p *Pipeline) processUploadTask(downloadResult DownloadResult) {
 		totalDuration := finished.Sub(task.Job.Created)
 		p.logger.JobStatus(task.Job, "UPLOAD_COMPLETE", "All parts uploaded successfully (total time: %v)", totalDuration)
 
-		// Cleanup
-		p.logger.JobStatus(task.Job, "CLEANING", "Cleaning up temporary files")
-		mediaprocess.CleanupFiles(mediaList)
+		// Cleanup only if uploading to Telegram
+		if p.config.UploadToTG {
+			p.logger.JobStatus(task.Job, "CLEANING", "Cleaning up temporary files")
+			mediaprocess.CleanupFiles(mediaList)
 
-		if err := os.RemoveAll(filepath.Dir(task.VideoFile)); err != nil {
-			p.logger.JobStatus(task.Job, "CLEANUP_WARNING", "Failed to remove directory: %v", err)
+			if err := os.RemoveAll(filepath.Dir(task.VideoFile)); err != nil {
+				p.logger.JobStatus(task.Job, "CLEANUP_WARNING", "Failed to remove directory: %v", err)
+			}
 		}
 
 		database.MarkAsDownloaded(filepath.Dir(task.VideoFile))
@@ -559,7 +648,10 @@ func (p *Pipeline) printStats() {
 	fmt.Printf("├── Completed: %d\n", p.stats.CompletedJobs)
 	fmt.Printf("├── Failed: %d\n", p.stats.FailedJobs)
 	fmt.Printf("├── Active Downloads: %d\n", p.stats.ActiveDownloads)
-	fmt.Printf("├── Active Uploads: %d\n", p.stats.ActiveUploads)
+	
+	if p.config.UploadToTG {
+		fmt.Printf("├── Active Uploads: %d\n", p.stats.ActiveUploads)
+	}
 
 	pending := p.stats.TotalJobs - p.stats.CompletedJobs - p.stats.FailedJobs
 	fmt.Printf("└── Pending: %d\n", pending)
@@ -610,32 +702,39 @@ func parseURLTXT(txtPath string) ([]string, error) {
 	return urls, nil
 }
 
-// loadConfig loads configuration from environment variables
-func loadConfig() (Config, error) {
+// loadConfig loads configuration from environment variables and command-line flags
+func loadConfig(outputDir string, uploadToTG bool) (Config, error) {
 	err := godotenv.Load(".env")
 	if err != nil {
 		log.Printf("Warning: Error loading .env file: %v", err)
 	}
 
-	targetStr := os.Getenv("TARGET")
-	if targetStr == "" {
-		return Config{}, fmt.Errorf("TARGET environment variable is required")
-	}
-
-	targetChatID, err := strconv.ParseInt(targetStr, 10, 64)
-	if err != nil {
-		return Config{}, fmt.Errorf("invalid TARGET value: %w", err)
-	}
-
-	return Config{
+	config := Config{
 		WorkerCount:  3, // Default value, will be overridden by user input
 		QueueSize:    3,
-		TargetChatID: targetChatID,
 		SessionDB:    "video_uploader.db",
-	}, nil
+		OutputDir:    outputDir,
+		UploadToTG:   uploadToTG,
+	}
+
+	// Only require TARGET if uploading to Telegram
+	if uploadToTG {
+		targetStr := os.Getenv("TARGET")
+		if targetStr == "" {
+			return Config{}, fmt.Errorf("TARGET environment variable is required when using -tg flag")
+		}
+
+		targetChatID, err := strconv.ParseInt(targetStr, 10, 64)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid TARGET value: %w", err)
+		}
+		config.TargetChatID = targetChatID
+	}
+
+	return config, nil
 }
 
-// setupTelegramClient initializes the Telegram client
+// setupTelegramClient initializes the Telegram client (only when needed)
 func setupTelegramClient() (*gotgproto.Client, error) {
 	apiID := os.Getenv("API_ID")
 	apiHash := os.Getenv("APP_HASH")
@@ -657,19 +756,40 @@ func setupTelegramClient() (*gotgproto.Client, error) {
 }
 
 func main() {
+	// Define command-line flags
+	output := flag.String("output", "./", "Output Directory")
+	uploadToTG := flag.Bool("tg", false, "Upload To Telegram And Delete Local Files")
+	
+	// Parse command-line flags
+	flag.Parse()
+
 	fmt.Println("🚀 M3U8 Downloader - Enhanced Pipeline Architecture")
 	fmt.Println("==================================================")
+	
+	// Display configuration
+	fmt.Printf("📁 Output Directory: %s\n", *output)
+	if *uploadToTG {
+		fmt.Println("📤 Telegram Upload: Enabled (files will be deleted after upload)")
+	} else {
+		fmt.Println("💾 Local Mode: Files will be kept locally")
+	}
+	fmt.Println()
 
-	// Load configuration
-	config, err := loadConfig()
+	// Load configuration with flag values
+	config, err := loadConfig(*output, *uploadToTG)
 	if err != nil {
 		log.Fatal("Configuration error:", err)
 	}
 
-	// Setup Telegram client
-	client, err := setupTelegramClient()
-	if err != nil {
-		log.Fatal("Telegram client error:", err)
+	// Setup Telegram client only if needed
+	var client *gotgproto.Client
+	if *uploadToTG {
+		client, err = setupTelegramClient()
+		if err != nil {
+			log.Fatal("Telegram client error:", err)
+		}
+	} else {
+		fmt.Println("ℹ️  Telegram client not initialized (local mode)")
 	}
 
 	// Get worker count from user
@@ -696,16 +816,17 @@ func main() {
 	// Handle shutdown gracefully
 	defer pipeline.Stop()
 
-	// Process input
-	if len(os.Args) > 1 {
+	// Process input - handle remaining args after flags
+	args := flag.Args()
+	if len(args) > 0 {
 		// Batch mode - process file
-		txtPath := os.Args[1]
+		txtPath := args[0]
 		urls, err := parseURLTXT(txtPath)
 		if err != nil {
 			log.Fatal("Failed to parse URL file:", err)
 		}
 
-		fmt.Printf("📁 Loaded %d URLs from file: %s\n", len(urls), txtPath)
+		fmt.Printf("📄 Loaded %d URLs from file: %s\n", len(urls), txtPath)
 		for _, url := range urls {
 			pipeline.SubmitJob(url)
 		}
