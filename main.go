@@ -417,7 +417,7 @@ func (p *Pipeline) startDownloadOnlyProcessor() {
 					totalDuration := finished.Sub(uploadResult.Task.Job.Created)
 					p.logger.JobStatus(uploadResult.Task.Job, "DOWNLOAD_COMPLETE", "Download completed in %v (kept locally)", totalDuration)
 
-					database.MarkAsDownloaded(filepath.Dir(uploadResult.Task.VideoFile))
+					database.MarkAsDownloaded(filepath.Base(filepath.Dir(uploadResult.Task.VideoFile)))
 					p.logger.JobStatus(uploadResult.Task.Job, "MARKED_COMPLETE", "Marked as downloaded in database")
 				}
 
