@@ -348,7 +348,7 @@ func (p *Pipeline) processDownloadJob(workerID int, job Job) {
 
 	// Merge video files
 	p.logger.JobStatus(job, "MERGING", "Starting file merge")
-	downloader.MergeFiles(outputDir, result.VideoFile)
+	downloader.MergeFiles(outputDir, result.VideoFile, result.ThumbFile)
 	p.logger.JobStatus(job, "MERGE_COMPLETE", "File merge finished: %s", result.VideoFile)
 
 	// Mark job as completed

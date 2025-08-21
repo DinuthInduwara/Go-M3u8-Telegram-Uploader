@@ -414,7 +414,7 @@ func StartDownloadTask(m3u8URL string, outputDir string, concurrentSegmentsCount
 	}
 }
 
-func MergeFiles(outputDir string, outputName string) {
+func MergeFiles(outputDir string, outputName string, thumbnailPath string) {
 	files, err := filepath.Glob(filepath.Join(outputDir, "*.ts"))
 	if err != nil {
 		fmt.Println("❌ Error finding .ts files: ")
@@ -450,10 +450,15 @@ func MergeFiles(outputDir string, outputName string) {
 		"-f", "concat",
 		"-safe", "0",
 		"-i", concatFile,
+		"-i", thumbnailPath,
+		"-map", "0",
+		"-map", "1",
 		"-c", "copy",
+		"-disposition:v:1", "attached_pic",
 		outputName,
 		"-y",
 	)
+
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
