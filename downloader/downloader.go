@@ -181,7 +181,7 @@ func (op *OverallProgress) UpdateSegment(segmentIndex int, completed bool, bytes
 	}
 }
 
-func (op *OverallProgress) printProgress() {
+func (op *OverallProgress) returnProgress()string {
 	percentage := float64(op.completedSegments) / float64(op.totalSegments) * 100
 	barWidth := 40
 	filled := int(percentage / 100 * float64(barWidth))
@@ -192,34 +192,78 @@ func (op *OverallProgress) printProgress() {
 	speed := float64(op.downloadedBytes) / elapsed.Seconds()
 	speedStr := formatBytes(int64(speed)) + "/s"
 
-	fmt.Printf("\r📥 M3U8 Download: [%s] %.1f%% (%d/%d segments) %s %s",
+	if op.completedSegments == op.totalSegments {
+		return "\n" // New line when complete
+	}
+	return fmt.Sprintf("\r📥 M3U8 Download: [%s] %.1f%% (%d/%d segments) %s %s",
 		bar, percentage, op.completedSegments, op.totalSegments,
 		formatBytes(op.downloadedBytes), speedStr)
-
-	if op.completedSegments == op.totalSegments {
-		fmt.Println() // New line when complete
-	}
 }
 
 func DisplayAllProgress(tasks []*OverallProgress) {
 	if len(tasks) == 0 {
 		return
 	}
+
 	// Hide cursor to prevent flickering
 	fmt.Print("\033[?25l")
+	defer fmt.Print("\033[?25h") // Show cursor when function exits
 
-	// Save current cursor position before we start printing
-	fmt.Print("\033[s")
+	// Move to the beginning of the current line
+	fmt.Print("\r")
 
+	// Build the entire output first
+	var output strings.Builder
 	for i, task := range tasks {
 		if i > 0 {
-			fmt.Print("\n") // Move to the next line for the next task
+			output.WriteString("\n")
 		}
-		fmt.Print("\033[2K") // Clear current line
-		task.printProgress()
+		output.WriteString(task.returnProgress())
 	}
 
-	fmt.Printf("\033[%dA", len(tasks)-1) // Move cursor up by (number of tasks - 1) lines
+	// Print the entire output
+	fmt.Print(output.String())
+
+	// Clear any remaining lines from previous longer outputs
+	// This handles the case where we previously had more tasks
+	for i := 0; i < 5; i++ { // Adjust this number based on max expected tasks
+		fmt.Print("\n\033[2K") // Move to next line and clear it
+	}
+
+	// Move cursor back to the first line of our progress display
+	fmt.Printf("\033[%dA", len(tasks)+5) // Move up by total lines we used
+}
+
+
+
+// Even better approach - fixed position display
+func DisplayAllProgressFixed(tasks []*OverallProgress) {
+	if len(tasks) == 0 {
+		return
+	}
+
+	// Save cursor position
+	fmt.Print("\033[s")
+	
+	// Hide cursor
+	fmt.Print("\033[?25l")
+	defer func() {
+		// Restore cursor position and show cursor
+		fmt.Print("\033[u\033[?25h")
+	}()
+
+	for i, task := range tasks {
+		// Clear the line and print progress
+		fmt.Print("\033[2K") // Clear line
+		fmt.Print(task.returnProgress())
+		
+		if i < len(tasks)-1 {
+			fmt.Print("\n") // Move to next line for next task
+		}
+	}
+	
+	// Move cursor back to saved position
+	fmt.Print("\033[u")
 }
 
 func formatBytes(bytes int64) string {

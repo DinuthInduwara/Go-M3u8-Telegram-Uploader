@@ -77,12 +77,12 @@ type Pipeline struct {
 
 // Config holds pipeline configuration
 type Config struct {
-	WorkerCount    int
-	QueueSize      int
-	TargetChatID   int64
-	SessionDB      string
-	OutputDir      string  // Added for custom output directory
-	UploadToTG     bool    // Added for telegram upload control
+	WorkerCount  int
+	QueueSize    int
+	TargetChatID int64
+	SessionDB    string
+	OutputDir    string // Added for custom output directory
+	UploadToTG   bool   // Added for telegram upload control
 }
 
 // PipelineStats tracks pipeline metrics
@@ -147,13 +147,13 @@ func NewPipeline(client *gotgproto.Client, config Config) *Pipeline {
 // Start initializes and starts the pipeline
 func (p *Pipeline) Start() error {
 	p.logger.Info("Starting M3U8 Download Pipeline")
-	p.logger.Info("Configuration: Workers=%d, QueueSize=%d, OutputDir=%s, UploadToTG=%t", 
+	p.logger.Info("Configuration: Workers=%d, QueueSize=%d, OutputDir=%s, UploadToTG=%t",
 		p.config.WorkerCount, p.config.QueueSize, p.config.OutputDir, p.config.UploadToTG)
 
 	// Start pipeline stages
 	p.startJobDispatcher()
 	p.startDownloadWorkers()
-	
+
 	// Only start upload worker if telegram upload is enabled
 	if p.config.UploadToTG {
 		p.startUploadWorker()
@@ -161,7 +161,7 @@ func (p *Pipeline) Start() error {
 		// If not uploading to telegram, directly process download results
 		p.startDownloadOnlyProcessor()
 	}
-	
+
 	p.startResultProcessor()
 	p.startStatsMonitor()
 
@@ -307,7 +307,7 @@ func (p *Pipeline) processDownloadJob(workerID int, job Job) {
 		// Create custom output directory structure
 		customOutputDir := filepath.Join(p.config.OutputDir, outputDir)
 		outputDir = customOutputDir
-		
+
 		// Ensure the custom directory exists
 		if err := os.MkdirAll(outputDir, 0755); err != nil {
 			result.Error = fmt.Errorf("failed to create output directory: %w", err)
@@ -641,7 +641,7 @@ func (p *Pipeline) printStats() {
 	fmt.Printf("├── Completed: %d\n", p.stats.CompletedJobs)
 	fmt.Printf("├── Failed: %d\n", p.stats.FailedJobs)
 	fmt.Printf("├── Active Downloads: %d\n", p.stats.ActiveDownloads)
-	
+
 	if p.config.UploadToTG {
 		fmt.Printf("├── Active Uploads: %d\n", p.stats.ActiveUploads)
 	}
@@ -703,11 +703,11 @@ func loadConfig(outputDir string, uploadToTG bool) (Config, error) {
 	}
 
 	config := Config{
-		WorkerCount:  3, // Default value, will be overridden by user input
-		QueueSize:    3,
-		SessionDB:    "video_uploader.db",
-		OutputDir:    outputDir,
-		UploadToTG:   uploadToTG,
+		WorkerCount: 3, // Default value, will be overridden by user input
+		QueueSize:   3,
+		SessionDB:   "video_uploader.db",
+		OutputDir:   outputDir,
+		UploadToTG:  uploadToTG,
 	}
 
 	// Only require TARGET if uploading to Telegram
@@ -752,13 +752,13 @@ func main() {
 	// Define command-line flags
 	output := flag.String("output", "./", "Output Directory")
 	uploadToTG := flag.Bool("tg", false, "Upload To Telegram And Delete Local Files")
-	
+
 	// Parse command-line flags
 	flag.Parse()
 
 	fmt.Println("🚀 M3U8 Downloader - Enhanced Pipeline Architecture")
 	fmt.Println("==================================================")
-	
+
 	// Display configuration
 	fmt.Printf("📁 Output Directory: %s\n", *output)
 	if *uploadToTG {
@@ -767,6 +767,13 @@ func main() {
 		fmt.Println("💾 Local Mode: Files will be kept locally")
 	}
 	fmt.Println()
+
+	go func() {
+		for {
+			downloader.DisplayAllProgressFixed(downloader.RunningTasks)
+			time.Sleep(time.Second)
+		}
+	}()
 
 	// Load configuration with flag values
 	config, err := loadConfig(*output, *uploadToTG)
